@@ -7,6 +7,12 @@
 #include "proc.h"
 #include "spinlock.h"
 
+
+
+int measure_active = 0;
+uint measure_start_ticks = 0;
+int measure_finished_count = 0;
+// 
 struct {
   struct spinlock lock;
   struct proc proc[NPROC];
@@ -64,7 +70,18 @@ myproc(void) {
   popcli();
   return p;
 }
-
+// Helper: Count RUNNABLE/RUNNING processes for a specific CPU
+int
+count_procs(int cpu_id)
+{
+  struct proc *p;
+  int count = 0;
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state != UNUSED && p->cpu_affinity == cpu_id)
+      count++;
+  }
+  return count;
+}
 //PAGEBREAK: 32
 // Look in the process table for an UNUSED proc.
 // If found, change state to EMBRYO and initialize
@@ -89,12 +106,25 @@ found:
   p->state = EMBRYO;
   p->pid = nextpid++;
   p->ctime = ticks;
-  struct cpu *c = mycpu();
-  if(c) {
-      p->cpu_affinity = c->apicid;
-  } else {
-      p->cpu_affinity = 0;
+  // struct cpu *c = mycpu();
+  // if(c) {
+  //     p->cpu_affinity = c->apicid;
+  // } else {
+  //     p->cpu_affinity = 0;
+  // }
+  int min_count = 10000;
+  int best_cpu = 0; 
+
+  for(int i = 0; i < ncpu; i++){
+    if(cpus[i].core_type == 0){
+      int cnt = count_procs(i);
+      if(cnt < min_count){
+        min_count = cnt;
+        best_cpu = i;
+      }
+    }
   }
+  p->cpu_affinity = best_cpu;
   release(&ptable.lock);
 
   // Allocate kernel stack.
@@ -252,8 +282,12 @@ exit(void)
   iput(curproc->cwd);
   end_op();
   curproc->cwd = 0;
-
-  acquire(&ptable.lock);
+  acquire(&ptable.lock); 
+  
+  if(measure_active){
+      measure_finished_count++;
+  }
+  // acquire(&ptable.lock);
 
   // Parent might be sleeping in wait().
   wakeup1(curproc->parent);
@@ -326,6 +360,63 @@ wait(void)
 //  - eventually that process transfers control
 //      via swtch back to the scheduler.
 // Inside proc.c
+// --- SECTION 4.4: LOAD BALANCER ---
+void
+load_balance(void)
+{
+  struct cpu *c = mycpu();
+  
+  if(c->core_type != 0)
+    return;
+
+  acquire(&ptable.lock);
+
+  int my_count = count_procs(c->apicid);
+  
+  int min_p_count = 10000;
+  int target_p_cpu = -1;
+
+  for(int i = 0; i < ncpu; i++){
+    if(cpus[i].core_type == 1){
+      int cnt = count_procs(i);
+      if(cnt < min_p_count){
+        min_p_count = cnt;
+        target_p_cpu = i;
+      }
+    }
+  }
+
+  if(target_p_cpu == -1) {
+    release(&ptable.lock);
+    return;
+  }
+
+  if(my_count >= min_p_count + 3){
+    
+    struct proc *p;
+    struct proc *victim = 0;
+
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p->state != UNUSED && p->cpu_affinity == c->apicid){
+        if(p->pid <= 2) continue; 
+        
+        if(victim == 0 || p->ctime < victim->ctime){
+          victim = p;
+        }
+      }
+    }
+
+    if(victim != 0){
+      victim->cpu_affinity = target_p_cpu;
+      cprintf("LB: Pushed PID %d from CPU %d to CPU %d\n", victim->pid, c->apicid, target_p_cpu);
+    }
+  }
+
+  release(&ptable.lock);
+}
+
+
+
 
 void
 scheduler(void)
@@ -344,8 +435,8 @@ scheduler(void)
 
       for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
         if(p->state != RUNNABLE) continue;
-        
-        if(p->cpu_affinity != c->apicid) continue;
+
+        if(p->cpu_affinity != c->apicid) continue; 
 
         if(lowest_p == 0 || p->ctime < lowest_p->ctime){
           lowest_p = p;
@@ -367,13 +458,13 @@ scheduler(void)
         
         if(p->state != RUNNABLE) continue;
         
-        if(p->cpu_affinity != c->apicid) continue;
+        if(p->cpu_affinity != c->apicid) continue; 
 
         c->proc = p;
         switchuvm(p);
         p->state = RUNNING;
         
-        p->tick_count = 0; 
+        p->tick_count = 0;
         
         swtch(&(c->scheduler), p->context);
         switchkvm();
@@ -561,4 +652,77 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+
+
+int
+sys_start_measure(void)
+{
+  measure_active = 1;
+  measure_start_ticks = ticks; // 'ticks' is a kernel global variable
+  measure_finished_count = 0;
+  return 0;
+}
+
+int
+sys_end_measure(void)
+{
+  if(!measure_active){
+      cprintf("Error: Measurement was not started.\n");
+      return -1;
+  }
+  
+  uint current_ticks = ticks;
+  uint duration = current_ticks - measure_start_ticks;
+  
+  
+  cprintf("\n--- Measurement Results ---\n");
+  cprintf("Total Processes Finished: %d\n", measure_finished_count);
+  cprintf("Total Time (ticks): %d\n", duration);
+  
+  if(duration > 0){
+      int throughput_x100 = (measure_finished_count * 10000) / (duration * 10); // *100 for seconds, *100 for decimals
+      
+      int whole = throughput_x100 / 100;
+      int decimal = throughput_x100 % 100;
+      
+      cprintf("Throughput: %d.%d processes/sec\n", whole, decimal);
+  } else {
+      cprintf("Throughput: Infinite (duration < 1 tick)\n");
+  }
+  cprintf("---------------------------\n");
+
+  measure_active = 0;
+  return 0;
+}
+
+int
+sys_print_info(void)
+{
+  struct proc *p = myproc();
+  // struct cpu *c = mycpu();
+  
+  cprintf("\n[Process Info]\n");
+  cprintf("PID: %d\n", p->pid);
+  cprintf("Name: %s\n", p->name);
+  
+  cprintf("Core Affinity: %d ", p->cpu_affinity);
+  if(p->cpu_affinity % 2 == 0)
+      cprintf("(E-Core)\n");
+  else
+      cprintf("(P-Core)\n");
+
+  cprintf("Scheduling Algorithm: ");
+  if(p->cpu_affinity % 2 == 0)
+      cprintf("Round Robin (Quantum=30ms)\n");
+  else
+      cprintf("FCFS (Priority=Creation Time)\n");
+
+  cprintf("Creation Time: %d\n", p->ctime);
+  cprintf("Current Time: %d\n", ticks);
+  cprintf("Lifetime: %d ticks\n", ticks - p->ctime);
+  cprintf("----------------\n");
+  
+  return 0;
 }

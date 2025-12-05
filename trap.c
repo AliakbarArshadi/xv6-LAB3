@@ -54,6 +54,10 @@ trap(struct trapframe *tf)
       wakeup(&ticks);
       release(&tickslock);
     }
+    if(ticks % 5 == 0){
+        extern void load_balance(void);
+        load_balance();
+    }
     lapiceoi();
     break;
   case T_IRQ0 + IRQ_IDE:
@@ -113,6 +117,7 @@ trap(struct trapframe *tf)
       }
     } 
       else {
+        cprintf("CPU %d (P-Core): PID %d running (FCFS)\n", mycpu()->apicid, myproc()->pid);
         yield();
       }
   }
