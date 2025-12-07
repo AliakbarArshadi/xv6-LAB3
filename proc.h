@@ -1,6 +1,7 @@
 // Per-CPU state
 // TYPE_E  = 0  
 // TYPE_P =  1  
+#include "spinlock.h"
 struct cpu {
   uchar apicid;                // Local APIC ID
   struct context *scheduler;   // swtch() here to enter scheduler
@@ -10,7 +11,9 @@ struct cpu {
   int ncli;                    // Depth of pushcli nesting.
   int intena;                  // Were interrupts enabled before pushcli?
   struct proc *proc; 
-  int core_type;          // The process running on this cpu or null
+  int core_type;  
+  struct proc *runq_head;  
+  struct spinlock lock;       
 };
 
 extern struct cpu cpus[NCPU];
@@ -55,6 +58,8 @@ struct proc {
   uint ctime;
   int tick_count;             
   int cpu_affinity;
+  struct proc *next_run;   
+
 };
 
 // Process memory is laid out contiguously, low addresses first:

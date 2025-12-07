@@ -29,6 +29,8 @@ main(void)
         cpus[i].core_type = 1;
         cprintf("CPU %d set as P-core\n", cpus[i].apicid);
     }
+    initlock(&cpus[i].lock, "cpurunq");
+    cpus[i].runq_head = 0;
 }     
   lapicinit();     // interrupt controller
   seginit();       // segment descriptors

@@ -7,7 +7,9 @@
 #include "proc.h"
 #include "spinlock.h"
 
-
+void enqueue(struct cpu *c, struct proc *p);
+struct proc* dequeue(struct cpu *c);
+int remove_from_queue(struct cpu *c, struct proc *victim);
 
 int measure_active = 0;
 uint measure_start_ticks = 0;
@@ -26,6 +28,47 @@ extern void trapret(void);
 
 static void wakeup1(void *chan);
 
+void
+enqueue(struct cpu *c, struct proc *p)
+{
+  acquire(&c->lock);
+  
+  p->next_run = 0; // It will be the end (usually)
+  p->cpu_affinity = c->apicid; // Keep this for info printing
+
+  if(c->runq_head == 0){
+    c->runq_head = p;
+    release(&c->lock);
+    return;
+  }
+
+  if(c->core_type == 1){
+    struct proc *curr = c->runq_head;
+    struct proc *prev = 0;
+
+    while(curr != 0 && curr->ctime <= p->ctime){
+      prev = curr;
+      curr = curr->next_run;
+    }
+
+    if(prev == 0){ 
+      p->next_run = c->runq_head;
+      c->runq_head = p;
+    } else { 
+      p->next_run = curr;
+      prev->next_run = p;
+    }
+  }
+  else {
+    struct proc *curr = c->runq_head;
+    while(curr->next_run != 0){
+      curr = curr->next_run;
+    }
+    curr->next_run = p;
+  }
+
+  release(&c->lock);
+}
 void
 pinit(void)
 {
@@ -70,7 +113,6 @@ myproc(void) {
   popcli();
   return p;
 }
-// Helper: Count RUNNABLE/RUNNING processes for a specific CPU
 int
 count_procs(int cpu_id)
 {
@@ -185,7 +227,8 @@ userinit(void)
   acquire(&ptable.lock);
 
   p->state = RUNNABLE;
-
+  struct cpu *target = &cpus[0];
+  enqueue(target, p);
   release(&ptable.lock);
 }
 
@@ -251,7 +294,8 @@ fork(void)
   acquire(&ptable.lock);
 
   np->state = RUNNABLE;
-
+  struct cpu *target = mycpu(); 
+  enqueue(target, np);
   release(&ptable.lock);
 
   return pid;
@@ -287,7 +331,6 @@ exit(void)
   if(measure_active){
       measure_finished_count++;
   }
-  // acquire(&ptable.lock);
 
   // Parent might be sleeping in wait().
   wakeup1(curproc->parent);
@@ -361,62 +404,69 @@ wait(void)
 //      via swtch back to the scheduler.
 // Inside proc.c
 // --- SECTION 4.4: LOAD BALANCER ---
+// In proc.c
+
 void
 load_balance(void)
 {
   struct cpu *c = mycpu();
   
-  if(c->core_type != 0)
+  if(c->core_type != 0) return;
+
+  acquire(&c->lock);
+
+  int my_count = 0;
+  struct proc *p = c->runq_head;
+  while(p){
+    my_count++;
+    p = p->next_run;
+  }
+
+  if(my_count < 2){ // Threshold: If I have few tasks, don't bother
+    release(&c->lock);
     return;
+  }
 
-  acquire(&ptable.lock);
-
-  int my_count = count_procs(c->apicid);
+ 
+  struct proc *victim = 0;
+  struct proc *curr = c->runq_head;
   
-  int min_p_count = 10000;
-  int target_p_cpu = -1;
+  while(curr != 0){
+    if(curr->pid > 2){ 
+       if(victim == 0 || curr->ctime < victim->ctime){
+           victim = curr;
+       }
+    }
+    curr = curr->next_run;
+  }
 
+  
+  if(victim == 0){
+      release(&c->lock);
+      return;
+  }
+
+  remove_from_queue(c, victim);
+  
+  release(&c->lock); 
+
+  struct cpu *target_cpu = 0;
+  
   for(int i = 0; i < ncpu; i++){
-    if(cpus[i].core_type == 1){
-      int cnt = count_procs(i);
-      if(cnt < min_p_count){
-        min_p_count = cnt;
-        target_p_cpu = i;
+      if(cpus[i].core_type == 1){
+          target_cpu = &cpus[i];
+          break; // Found one
       }
-    }
   }
-
-  if(target_p_cpu == -1) {
-    release(&ptable.lock);
-    return;
+  
+  if(target_cpu){
+      enqueue(target_cpu, victim); 
+      cprintf("LB: Moved PID %d to CPU %d\n", victim->pid, target_cpu->apicid);
+  } else {
+      enqueue(c, victim);
   }
-
-  if(my_count >= min_p_count + 3){
-    
-    struct proc *p;
-    struct proc *victim = 0;
-
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != UNUSED && p->cpu_affinity == c->apicid){
-        if(p->pid <= 2) continue; 
-        
-        if(victim == 0 || p->ctime < victim->ctime){
-          victim = p;
-        }
-      }
-    }
-
-    if(victim != 0){
-      victim->cpu_affinity = target_p_cpu;
-      cprintf("LB: Pushed PID %d from CPU %d to CPU %d\n", victim->pid, c->apicid, target_p_cpu);
-    }
-  }
-
-  release(&ptable.lock);
 }
-
-
-
+// In proc.c
 
 void
 scheduler(void)
@@ -425,64 +475,54 @@ scheduler(void)
   struct cpu *c = mycpu();
   c->proc = 0;
   
-  for(;;){
+  while(1){
     sti();
 
-    acquire(&ptable.lock);
+    p = dequeue(c);
 
-    if(c->core_type == 1){ 
-      struct proc *lowest_p = 0;
-
-      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-        if(p->state != RUNNABLE) continue;
-
-        if(p->cpu_affinity != c->apicid) continue; 
-
-        if(lowest_p == 0 || p->ctime < lowest_p->ctime){
-          lowest_p = p;
-        }
+    if(p != 0){
+      c->proc = p;
+      
+      acquire(&ptable.lock); 
+      if(p->state != RUNNABLE){
+          release(&ptable.lock);
+          continue;
       }
+      
+      switchuvm(p);
+      p->state = RUNNING;
+      
+      if(c->core_type == 0) p->tick_count = 0;
 
-      if(lowest_p != 0){
-        p = lowest_p;
-        c->proc = p;
-        switchuvm(p);
-        p->state = RUNNING;
-        swtch(&(c->scheduler), p->context);
-        switchkvm();
-        c->proc = 0;
-      }
+      swtch(&(c->scheduler), p->context);
+      switchkvm();
+
+      c->proc = 0;
+      release(&ptable.lock);
     }
-    else { 
-      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-        
-        if(p->state != RUNNABLE) continue;
-        
-        if(p->cpu_affinity != c->apicid) continue; 
-
-        c->proc = p;
-        switchuvm(p);
-        p->state = RUNNING;
-        
-        p->tick_count = 0;
-        
-        swtch(&(c->scheduler), p->context);
-        switchkvm();
-        c->proc = 0;
-      }
+    else {
+        // hlt(); 
     }
-
-    release(&ptable.lock);
   }
 }
 
-// Enter scheduler.  Must hold only ptable.lock
-// and have changed proc->state. Saves and restores
-// intena because intena is a property of this
-// kernel thread, not this CPU. It should
-// be proc->intena and proc->ncli, but that would
-// break in the few places where a lock is held but
-// there's no process.
+
+
+struct proc*
+dequeue(struct cpu *c)
+{
+  acquire(&c->lock);
+  
+  struct proc *p = c->runq_head;
+  if(p != 0){
+    c->runq_head = p->next_run; 
+    p->next_run = 0; 
+  }
+
+  release(&c->lock);
+  return p;
+}
+
 void
 sched(void)
 {
@@ -502,12 +542,12 @@ sched(void)
   mycpu()->intena = intena;
 }
 
-// Give up the CPU for one scheduling round.
 void
 yield(void)
 {
-  acquire(&ptable.lock);  //DOC: yieldlock
+  acquire(&ptable.lock);  
   myproc()->state = RUNNABLE;
+  enqueue(mycpu(), myproc());
   sched();
   release(&ptable.lock);
 }
@@ -571,7 +611,28 @@ sleep(void *chan, struct spinlock *lk)
     acquire(lk);
   }
 }
+int
+remove_from_queue(struct cpu *c, struct proc *victim)
+{
+  struct proc *curr = c->runq_head;
+  struct proc *prev = 0;
 
+  while(curr != 0){
+    if(curr == victim){
+      if(prev == 0){
+        c->runq_head = curr->next_run;
+      } else {
+        prev->next_run = curr->next_run;
+      }
+      
+      curr->next_run = 0; 
+      return 0; 
+    }
+    prev = curr;
+    curr = curr->next_run;
+  }
+  return -1; // Not found
+}
 //PAGEBREAK!
 // Wake up all processes sleeping on chan.
 // The ptable lock must be held.
@@ -579,10 +640,14 @@ static void
 wakeup1(void *chan)
 {
   struct proc *p;
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
 
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == SLEEPING && p->chan == chan)
+    if(p->state == SLEEPING && p->chan == chan ){
       p->state = RUNNABLE;
+      struct cpu *target = &cpus[p->cpu_affinity]; 
+      enqueue(target, p);
+    }
+  }
 }
 
 // Wake up all processes sleeping on chan.
@@ -660,7 +725,7 @@ int
 sys_start_measure(void)
 {
   measure_active = 1;
-  measure_start_ticks = ticks; // 'ticks' is a kernel global variable
+  measure_start_ticks = ticks; 
   measure_finished_count = 0;
   return 0;
 }
@@ -682,7 +747,7 @@ sys_end_measure(void)
   cprintf("Total Time (ticks): %d\n", duration);
   
   if(duration > 0){
-      int throughput_x100 = (measure_finished_count * 10000) / (duration * 10); // *100 for seconds, *100 for decimals
+      int throughput_x100 = (measure_finished_count * 10000) / (duration * 10); 
       
       int whole = throughput_x100 / 100;
       int decimal = throughput_x100 % 100;
@@ -701,7 +766,6 @@ int
 sys_print_info(void)
 {
   struct proc *p = myproc();
-  // struct cpu *c = mycpu();
   
   cprintf("\n[Process Info]\n");
   cprintf("PID: %d\n", p->pid);
